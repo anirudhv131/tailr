@@ -351,28 +351,52 @@ async function tailorDocx(buffer, jd){
   return { blob, changes };
 }
 
-/* =========================== PDF (rebuild clean) ========================= */
+/* ===================== PDF (edit in place, keep layout) ==================
+   We keep the ORIGINAL pdf as the canvas and only patch changed lines:
+   cover the old text with a background-colored box, then stamp the new text
+   at the same position and size. Untouched content stays pixel-identical.   */
+
+// strip characters the standard PDF fonts (WinAnsi) can't encode
+const pdfSafe = t => t
+  .replace(/[\u0000-\u001F\u007F-\u009F]/g,' ')
+  .replace(/[\u2018\u2019\u201A\u201B]/g,"'")
+  .replace(/[\u201C\u201D\u201E\u201F]/g,'"')
+  .replace(/[\u2013\u2014\u2015]/g,'-')
+  .replace(/\u2026/g,'...')
+  .replace(/[\u25AA\u25CF\u2023\u2043\u2219\u2666]/g,'\u2022')
+  .replace(/\u00A0/g,' ')
+  .replace(/\u20AC/g,'EUR').replace(/\u2122/g,'(TM)')
+  .replace(/[^\x20-\xFF\u2022]/g,'')
+  .replace(/\s{2,}/g,' ').trim();
+
 async function readPdfLines(buffer){
   const pdf = await pdfjsLib.getDocument({ data: buffer.slice(0) }).promise;
   const lines = [];
   for (let n=1;n<=pdf.numPages;n++){
     const page = await pdf.getPage(n);
     const content = await page.getTextContent();
+    const styles = content.styles || {};
     const rows = {};
     content.items.forEach(it => {
-      if (!it.str.trim() && it.str !== ' ') return;
-      const y = Math.round(it.transform[5]);
-      const size = Math.abs(it.transform[0]) || it.height || 11;
-      const key = Object.keys(rows).find(k => Math.abs(k - y) <= 3) || y;
-      (rows[key] = rows[key] || { items:[], size:0 });
-      rows[key].items.push({ x:it.transform[4], s:it.str });
+      if (!it.str.trim()) return;
+      const y = it.transform[5];
+      const size = Math.hypot(it.transform[0], it.transform[1]) || it.height || 11;
+      const fam = (styles[it.fontName] && styles[it.fontName].fontFamily || '').toLowerCase();
+      const key = Object.keys(rows).find(k => Math.abs(k - y) <= 3) || String(y);
+      (rows[key] = rows[key] || { items:[], size:0, serif:false });
+      rows[key].items.push({ x:it.transform[4], w:it.width||0, s:it.str, y });
       rows[key].size = Math.max(rows[key].size, size);
+      if (fam.includes('serif') && !fam.includes('sans')) rows[key].serif = true;
     });
+    let pageRight = 0;
+    Object.values(rows).forEach(r => r.items.forEach(i => pageRight = Math.max(pageRight, i.x + i.w)));
     Object.keys(rows).map(Number).sort((a,b)=>b-a).forEach(y => {
-      const r = rows[y];
-      r.items.sort((a,b)=>a.x-b.x);
+      const r = rows[y]; r.items.sort((a,b)=>a.x-b.x);
       const text = r.items.map(i=>i.s).join('').replace(/\s+/g,' ').trim();
-      if (text) lines.push({ text, size:r.size, page:n });
+      if (!text) return;
+      const x0 = r.items[0].x;
+      const x1 = r.items[r.items.length-1].x + r.items[r.items.length-1].w;
+      lines.push({ text, size:r.size, page:n, x:x0, y, right:x1, serif:r.serif, pageRight });
     });
   }
   return lines;
@@ -383,59 +407,44 @@ async function tailorPdf(buffer, jd){
   const listed = lines.map((l,i)=>({ i, text:l.text }));
   const edits = await tailorLines(listed, jd);
 
-  const changes = [];
   const map = {}; edits.forEach(e => { map[e.i] = e.text; });
-  const finalLines = lines.map((l,i) => {
-    if (map[i] && map[i] !== l.text){ changes.push({ before:l.text, after:map[i] }); return { ...l, text:map[i] }; }
-    return l;
-  });
+  const changes = [];
 
-  // rebuild a clean PDF
   const { PDFDocument, StandardFonts, rgb } = PDFLib;
-  const doc = await PDFDocument.create();
-  const font = await doc.embedFont(StandardFonts.Helvetica);
-  const bold = await doc.embedFont(StandardFonts.HelveticaBold);
-  const W=612, H=792, M=54, maxW=W-M*2;
-  const sizes = finalLines.map(l=>l.size).sort((a,b)=>a-b);
+  const doc = await PDFDocument.load(buffer.slice(0), { ignoreEncryption:true });
+  const pages = doc.getPages();
+  const fonts = {
+    sans:  await doc.embedFont(StandardFonts.Helvetica),
+    sansB: await doc.embedFont(StandardFonts.HelveticaBold),
+    serif: await doc.embedFont(StandardFonts.TimesRoman),
+    serifB:await doc.embedFont(StandardFonts.TimesRomanBold),
+  };
+  const sizes = lines.map(l=>l.size).sort((a,b)=>a-b);
   const median = sizes[Math.floor(sizes.length/2)] || 11;
 
-  let page = doc.addPage([W,H]); let y = H-M;
-  // strip anything the standard PDF font (WinAnsi) can't encode, so it never crashes
-  const pdfSafe = t => t
-    .replace(/[\u0000-\u001F\u007F-\u009F]/g,' ')
-    .replace(/[\u2018\u2019\u201A\u201B]/g,"'")
-    .replace(/[\u201C\u201D\u201E\u201F]/g,'"')
-    .replace(/[\u2013\u2014\u2015]/g,'-')
-    .replace(/\u2026/g,'...')
-    .replace(/[\u25AA\u25CF\u2023\u2043\u2219\u2666]/g,'\u2022')
-    .replace(/\u00A0/g,' ')
-    .replace(/\u20AC/g,'EUR').replace(/\u2122/g,'(TM)')
-    .replace(/[^\x20-\xFF\u2022]/g,'')
-    .replace(/\s{2,}/g,' ').trim();
-  const draw = (text, f, fs, color, indent=0) => {
-    text = pdfSafe(text); if (!text) return;
-    const words = text.split(' '); let line='';
-    const flush = () => {
-      if (y < M+fs){ page = doc.addPage([W,H]); y = H-M; }
-      page.drawText(line, { x:M+indent, y, size:fs, font:f, color });
-      y -= fs*1.38;
-    };
-    for (const w of words){
-      const test = line ? line+' '+w : w;
-      if (f.widthOfTextAtSize(test, fs) > maxW-indent && line){ flush(); line=w; }
-      else line = test;
-    }
-    if (line) flush();
-  };
+  lines.forEach((l,i) => {
+    const nt = map[i] && map[i] !== l.text ? pdfSafe(map[i]) : null;
+    if (!nt) return;
+    changes.push({ before:l.text, after:map[i] });
 
-  finalLines.forEach((l,idx) => {
-    const isHeading = l.size >= median*1.18 || (/^[A-Z0-9 &,\.]+$/.test(l.text) && l.text.length<32);
-    const isName = idx===0;
-    const isBullet = /^[•\-\*·]/.test(l.text);
-    if (isName){ draw(l.text, bold, 20, rgb(.09,.1,.14)); y-=4; }
-    else if (isHeading){ y-=6; draw(l.text.toUpperCase(), bold, 11.5, rgb(.31,.27,.9)); y-=1; }
-    else if (isBullet){ draw(l.text.replace(/^[•\-\*·]\s*/,'• '), font, 10.5, rgb(.13,.14,.18), 8); }
-    else { draw(l.text, font, 10.5, rgb(.13,.14,.18)); }
+    const page = pages[l.page-1]; if (!page) return;
+    const isHeading = l.size >= median*1.18;
+    const font = l.serif ? (isHeading?fonts.serifB:fonts.serif) : (isHeading?fonts.sansB:fonts.sans);
+
+    // cover the original text (assume white/near-white background)
+    const pad = l.size*0.25;
+    page.drawRectangle({
+      x:l.x-1, y:l.y-l.size*0.28, width:(Math.max(l.right, l.pageRight? l.pageRight:l.right)-l.x)+2,
+      height:l.size*1.30, color:rgb(1,1,1)
+    });
+
+    // shrink to fit the original text column so we never overflow the margin
+    let fs = l.size;
+    const avail = Math.max(60, (l.pageRight || l.right) - l.x);
+    const wNow = font.widthOfTextAtSize(nt, fs);
+    if (wNow > avail) fs = Math.max(fs*0.62, fs*avail/wNow);
+
+    page.drawText(nt, { x:l.x, y:l.y, size:fs, font, color:rgb(0.09,0.10,0.14) });
   });
 
   const bytes = await doc.save();
@@ -469,7 +478,7 @@ $('run').onclick = async () => {
 function renderResult(changes){
   $('resultSub').textContent = state.kind==='docx'
     ? changes.length + ' line(s) rewritten · original formatting preserved'
-    : changes.length + ' line(s) rewritten · clean PDF rebuilt';
+    : changes.length + ' line(s) rewritten · original layout kept';
   const box = $('changes');
   if (!changes.length){
     box.innerHTML = '<div class="empty-changes">No changes were needed. This resume already fits the posting well.</div>';
