@@ -400,7 +400,20 @@ async function tailorPdf(buffer, jd){
   const median = sizes[Math.floor(sizes.length/2)] || 11;
 
   let page = doc.addPage([W,H]); let y = H-M;
+  // strip anything the standard PDF font (WinAnsi) can't encode, so it never crashes
+  const pdfSafe = t => t
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g,' ')
+    .replace(/[\u2018\u2019\u201A\u201B]/g,"'")
+    .replace(/[\u201C\u201D\u201E\u201F]/g,'"')
+    .replace(/[\u2013\u2014\u2015]/g,'-')
+    .replace(/\u2026/g,'...')
+    .replace(/[\u25AA\u25CF\u2023\u2043\u2219\u2666]/g,'\u2022')
+    .replace(/\u00A0/g,' ')
+    .replace(/\u20AC/g,'EUR').replace(/\u2122/g,'(TM)')
+    .replace(/[^\x20-\xFF\u2022]/g,'')
+    .replace(/\s{2,}/g,' ').trim();
   const draw = (text, f, fs, color, indent=0) => {
+    text = pdfSafe(text); if (!text) return;
     const words = text.split(' '); let line='';
     const flush = () => {
       if (y < M+fs){ page = doc.addPage([W,H]); y = H-M; }
